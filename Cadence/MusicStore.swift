@@ -75,7 +75,10 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func importFiles(_ urls: [URL]) {
-        guard !importing else { return }
+        guard !importing else {
+            error = "A song is still being imported. Wait for it to finish, then share the next file."
+            return
+        }
         guard !urls.isEmpty else {
             error = "No file was received from Files. Download the song in Files, then select it again."
             return

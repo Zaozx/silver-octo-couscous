@@ -31,6 +31,16 @@ struct LibraryView: View {
         }
         .toolbarBackground(Theme.background, for: .tabBar)
         .toolbarBackground(.visible, for: .tabBar)
+        .onOpenURL { url in
+            guard url.isFileURL else {
+                music.error = "Share an audio file from Files, not a website link."
+                return
+            }
+            selectedTab = 0
+            importPresented = false
+            nowPresented = false
+            music.importFiles([url])
+        }
         .sheet(isPresented: $importPresented) {
             AudioImportPicker { urls in
                 selectedTab = 0
@@ -136,6 +146,7 @@ struct CollectionView: View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("CADENCE").font(.caption.weight(.bold)).tracking(2).foregroundStyle(Theme.mint)
+                Text("Version 1.0.2").font(.caption).foregroundStyle(Theme.muted)
                 Text("Stay for\nthe music.").font(.system(.largeTitle, design: .rounded, weight: .bold))
                 if let first = music.songs.first {
                     Button { music.play(first, in: music.songs) } label: { Label("Press play", systemImage: "play.fill").font(.subheadline.bold()) }
@@ -321,7 +332,7 @@ struct AudioImportPicker: UIViewControllerRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel) }
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.audio], asCopy: true)
-        picker.allowsMultipleSelection = true
+        picker.allowsMultipleSelection = false
         picker.shouldShowFileExtensions = true
         picker.delegate = context.coordinator
         return picker
