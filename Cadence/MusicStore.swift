@@ -33,6 +33,7 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var shuffle = false
     @Published var repeatMode = 0
     @Published var importing = false
+    @Published var importStatus = ""
     @Published var error: String?
     private var player: AVAudioPlayer?
     private var queue: [UUID] = []
@@ -75,28 +76,36 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     func importFiles(_ urls: [URL]) {
         guard !importing else { return }
+        guard !urls.isEmpty else {
+            error = "No file was received from Files. Download the song in Files, then select it again."
+            return
+        }
         importing = true
+        importStatus = "Preparing \(urls.count) selected file(s)…"
         let destinationFolder = folder
         // Hold document-provider access while copying on a background queue.
         let access = urls.map { ($0, $0.startAccessingSecurityScopedResource()) }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var imported: [Song] = []
             var failures: [String] = []
-            for (url, scoped) in access {
+            for (index, item) in access.enumerated() {
+                let (url, scoped) = item
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                DispatchQueue.main.async { [weak self] in
+                    self?.importStatus = "Adding \(index + 1) of \(urls.count): \(url.lastPathComponent)"
+                }
                 let id = UUID()
                 let name = id.uuidString + "." + url.pathExtension
                 let destination = destinationFolder.appendingPathComponent(name)
                 do {
-                    let coordinator = NSFileCoordinator()
-                    var coordinationError: NSError?
-                    var copyError: Error?
-                    coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
-                        do { try FileManager.default.copyItem(at: readable, to: destination) }
-                        catch { copyError = error }
+                    // The document picker supplies a local copy. Do not start a
+                    // second provider coordination operation after it dismisses.
+                    try FileManager.default.createDirectory(at: destinationFolder, withIntermediateDirectories: true)
+                    try FileManager.default.copyItem(at: url, to: destination)
+                    let attributes = try FileManager.default.attributesOfItem(atPath: destination.path)
+                    if (attributes[.size] as? NSNumber)?.int64Value == 0 {
+                        throw NSError(domain: "CadenceImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "The selected file is empty. Download it fully in Files and try again."])
                     }
-                    if let coordinationError { throw coordinationError }
-                    if let copyError { throw copyError }
                     // Reject unsupported or corrupt audio before adding it to the library.
                     _ = try AVAudioPlayer(contentsOf: destination)
                     let stem = url.deletingPathExtension().lastPathComponent
@@ -106,7 +115,8 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
                         artist: parts.count > 1 ? parts[0] : "Local music"))
                 } catch {
                     try? FileManager.default.removeItem(at: destination)
-                    failures.append(url.lastPathComponent)
+                    let details = error as NSError
+                    failures.append("\(url.lastPathComponent): \(details.localizedDescription) [\(details.domain) \(details.code)]")
                 }
             }
             let results = imported
@@ -115,7 +125,10 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 guard let self else { return }
                 self.songs.append(contentsOf: results)
                 self.save(); self.importing = false
-                if !failed.isEmpty { self.error = "Could not import: " + failed.joined(separator: ", ") + ". Try MP3, M4A, or WAV files." }
+                self.importStatus = results.isEmpty ? "No songs were added." : "Added \(results.count) \(results.count == 1 ? "song" : "songs"). Tap a song below to play."
+                if !failed.isEmpty {
+                    self.error = "Could not import:\n\n" + failed.joined(separator: "\n\n") + "\n\nTry opening the file in the Files app first. Use a fully downloaded MP3, M4A, or WAV file."
+                }
             }
         }
     }

@@ -14,26 +14,30 @@ struct LibraryView: View {
     @EnvironmentObject private var music: MusicStore
     @State private var importPresented = false
     @State private var nowPresented = false
+    @State private var selectedTab = 0
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             NavigationStack {
                 CollectionView(title: "Your library", likedOnly: false, importMusic: { importPresented = true })
                     .safeAreaInset(edge: .bottom, spacing: 0) { miniPlayer }
-            }.tabItem { Label("Library", systemImage: "square.stack.fill") }
+            }.tabItem { Label("Library", systemImage: "square.stack.fill") }.tag(0)
             NavigationStack {
                 CollectionView(title: "Liked songs", likedOnly: true, importMusic: { importPresented = true })
                     .safeAreaInset(edge: .bottom, spacing: 0) { miniPlayer }
-            }.tabItem { Label("Liked", systemImage: "heart.fill") }
+            }.tabItem { Label("Liked", systemImage: "heart.fill") }.tag(1)
             NavigationStack {
                 PlaylistsView().safeAreaInset(edge: .bottom, spacing: 0) { miniPlayer }
-            }.tabItem { Label("Playlists", systemImage: "music.note.list") }
+            }.tabItem { Label("Playlists", systemImage: "music.note.list") }.tag(2)
         }
         .toolbarBackground(Theme.background, for: .tabBar)
         .toolbarBackground(.visible, for: .tabBar)
-        .fileImporter(isPresented: $importPresented, allowedContentTypes: [.audio], allowsMultipleSelection: true) { result in
-            switch result {
-            case .success(let urls): music.importFiles(urls)
-            case .failure(let error): music.error = error.localizedDescription
+        .sheet(isPresented: $importPresented) {
+            AudioImportPicker { urls in
+                selectedTab = 0
+                music.importFiles(urls)
+                importPresented = false
+            } onCancel: {
+                importPresented = false
             }
         }
         .sheet(isPresented: $nowPresented) { NowPlayingView().presentationDragIndicator(.visible) }
@@ -96,7 +100,11 @@ struct CollectionView: View {
                         } label: { Label("Shuffle", systemImage: "shuffle").font(.subheadline.weight(.semibold)) }
                     }
                 }
-                if music.importing { ProgressView("Adding your music…").padding(.vertical) }
+                if music.importing {
+                    ProgressView(music.importStatus).padding(.vertical)
+                } else if !music.importStatus.isEmpty && !likedOnly && playlistID == nil {
+                    Text(music.importStatus).font(.subheadline).foregroundStyle(Theme.mint)
+                }
                 if visible.isEmpty {
                     ContentUnavailableView {
                         Label(search.isEmpty ? "Make room for your music" : "No matching songs", systemImage: likedOnly ? "heart" : "music.note")
@@ -114,6 +122,7 @@ struct CollectionView: View {
         }
         .background(Theme.background).navigationTitle(title)
         .searchable(text: $search, prompt: "Songs or artists")
+        .onChange(of: music.songs.count) { old, new in if new > old { search = "" } }
         .toolbar {
             if let importMusic {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -302,4 +311,29 @@ struct AirPlayPicker: UIViewRepresentable {
         return picker
     }
     func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
+}
+
+// Import a copy rather than opening a document-provider URL in place.
+// iOS completes the provider handoff before delivering the selected URLs.
+struct AudioImportPicker: UIViewControllerRepresentable {
+    let onPick: ([URL]) -> Void
+    let onCancel: () -> Void
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel) }
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.audio], asCopy: true)
+        picker.allowsMultipleSelection = true
+        picker.shouldShowFileExtensions = true
+        picker.delegate = context.coordinator
+        return picker
+    }
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: ([URL]) -> Void
+        let onCancel: () -> Void
+        init(onPick: @escaping ([URL]) -> Void, onCancel: @escaping () -> Void) {
+            self.onPick = onPick; self.onCancel = onCancel
+        }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { onPick(urls) }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onCancel() }
+    }
 }
