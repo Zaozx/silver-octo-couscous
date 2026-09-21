@@ -2,6 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import MediaPlayer
 import AVKit
+import SafariServices
 
 enum Theme {
     static let background = Color(red: 0.04, green: 0.06, blue: 0.05)
@@ -21,6 +22,10 @@ struct LibraryView: View {
                 CollectionView(title: "Your library", likedOnly: false, importMusic: { importPresented = true })
                     .safeAreaInset(edge: .bottom, spacing: 0) { miniPlayer }
             }.tabItem { Label("Library", systemImage: "square.stack.fill") }.tag(0)
+            NavigationStack {
+                SpotifySearchView()
+                    .safeAreaInset(edge: .bottom, spacing: 0) { miniPlayer }
+            }.tabItem { Label("Search", systemImage: "magnifyingglass") }.tag(3)
             NavigationStack {
                 CollectionView(title: "Liked songs", likedOnly: true, importMusic: { importPresented = true })
                     .safeAreaInset(edge: .bottom, spacing: 0) { miniPlayer }
@@ -146,7 +151,7 @@ struct CollectionView: View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("CADENCE").font(.caption.weight(.bold)).tracking(2).foregroundStyle(Theme.mint)
-                Text("Version 1.0.2").font(.caption).foregroundStyle(Theme.muted)
+                Text("Version 1.1.0").font(.caption).foregroundStyle(Theme.muted)
                 Text("Stay for\nthe music.").font(.system(.largeTitle, design: .rounded, weight: .bold))
                 if let first = music.songs.first {
                     Button { music.play(first, in: music.songs) } label: { Label("Press play", systemImage: "play.fill").font(.subheadline.bold()) }
@@ -347,4 +352,89 @@ struct AudioImportPicker: UIViewControllerRepresentable {
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { onPick(urls) }
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onCancel() }
     }
+}
+
+// Spotify's public website supplies the actual results. Cadence does not
+// scrape the catalog, embed API secrets, or claim to download Spotify audio.
+private struct SpotifySearchPage: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct SpotifySearchView: View {
+    @State private var query = ""
+    @State private var page: SpotifySearchPage?
+    @FocusState private var focused: Bool
+    @Environment(\.openURL) private var openURL
+    @State private var launchError = false
+
+    private var searchURL: URL? {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return nil }
+        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        guard let encoded = term.addingPercentEncoding(withAllowedCharacters: safe) else { return nil }
+        return URL(string: "https://open.spotify.com/search/" + encoded)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Find your next song.").font(.title2.bold())
+                    Text("Search songs, artists, or albums on Spotify.")
+                        .foregroundStyle(Theme.muted)
+                }
+                HStack(spacing: 12) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(Theme.muted)
+                    TextField("Song, artist, or album", text: $query)
+                        .focused($focused).submitLabel(.search)
+                        .autocorrectionDisabled().onSubmit(search)
+                        .accessibilityLabel("Spotify search")
+                    if !query.isEmpty {
+                        Button { query = ""; focused = true } label: {
+                            Image(systemName: "xmark.circle.fill").frame(width: 36, height: 44)
+                        }.accessibilityLabel("Clear search")
+                    }
+                }.padding(.horizontal, 16).padding(.vertical, 6)
+                    .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14))
+                Button(action: search) {
+                    Label("Search Spotify", systemImage: "magnifyingglass")
+                        .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 8)
+                }.buttonStyle(.borderedProminent).foregroundStyle(Theme.background)
+                    .disabled(searchURL == nil)
+                Text("Results open on Spotify’s website in a browser inside Cadence. Spotify may ask you to sign in. Audio is not downloaded into your library.")
+                    .font(.subheadline).foregroundStyle(Theme.muted)
+                Button {
+                    guard let url = searchURL else { return }
+                    focused = false
+                    openURL(url) { accepted in if !accepted { launchError = true } }
+                } label: { Label("Open search outside Cadence", systemImage: "arrow.up.right.square") }
+                    .disabled(searchURL == nil)
+                Text("Your imported songs are still available in the Library tab.")
+                    .font(.subheadline).foregroundStyle(Theme.muted)
+            }.padding(24).frame(maxWidth: 600).frame(maxWidth: .infinity)
+        }.background(Theme.background).navigationTitle("Search")
+            .sheet(item: $page) { target in SpotifyBrowser(url: target.url).ignoresSafeArea() }
+            .alert("Could not open Spotify", isPresented: $launchError) {
+                Button("OK", role: .cancel) {}
+            } message: { Text("Check your connection and try Search Spotify again.") }
+    }
+
+    private func search() {
+        guard let url = searchURL else { return }
+        focused = false
+        page = SpotifySearchPage(url: url)
+    }
+}
+
+struct SpotifyBrowser: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let browser = SFSafariViewController(url: url)
+        browser.preferredControlTintColor = UIColor(Theme.mint)
+        browser.preferredBarTintColor = UIColor(Theme.background)
+        browser.dismissButtonStyle = .done
+        return browser
+    }
+    func updateUIViewController(_ controller: SFSafariViewController, context: Context) {}
 }
