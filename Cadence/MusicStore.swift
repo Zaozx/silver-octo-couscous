@@ -10,6 +10,8 @@ struct Song: Identifiable, Codable, Equatable {
     var title: String
     var artist: String
     var liked = false
+    // Optional so libraries from earlier versions still decode.
+    var folderSource: String? = nil
 }
 
 struct Playlist: Identifiable, Codable {
@@ -21,6 +23,12 @@ struct Playlist: Identifiable, Codable {
 private struct SavedLibrary: Codable {
     var songs: [Song]
     var playlists: [Playlist]
+}
+
+private struct LinkedMusicFolder: Codable {
+    var id: UUID
+    var name: String
+    var bookmark: Data
 }
 
 final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
@@ -35,17 +43,26 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var importing = false
     @Published var importStatus = ""
     @Published var error: String?
+    @Published private(set) var syncFolderName: String?
+    @Published private(set) var syncing = false
+    @Published private(set) var syncStatus = "Choose a folder to start."
+    @Published private(set) var syncDetails = ""
+    @Published private(set) var lastSync: Date?
+    private var linkedFolder: LinkedMusicFolder?
+    private var syncTimer: Timer?
     private var player: AVAudioPlayer?
     private var queue: [UUID] = []
     private var timer: Timer?
     private let folder: URL
     private let database: URL
+    private let syncSettings: URL
 
     override init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Cadence", isDirectory: true)
         folder = support.appendingPathComponent("Music", isDirectory: true)
         database = support.appendingPathComponent("library.json")
+        syncSettings = support.appendingPathComponent("linked-folder.json")
         super.init()
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -54,6 +71,17 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 songs = saved.songs; playlists = saved.playlists
             }
         } catch { self.error = "Your library could not be loaded: \(error.localizedDescription)" }
+        if FileManager.default.fileExists(atPath: syncSettings.path) {
+            do {
+                linkedFolder = try JSONDecoder().decode(LinkedMusicFolder.self, from: Data(contentsOf: syncSettings))
+                syncFolderName = linkedFolder?.name
+                syncStatus = "Ready to check for new songs."
+            } catch { syncStatus = "Folder access could not be restored. Choose the folder again." }
+        }
+        syncTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard UIApplication.shared.applicationState == .active else { return }
+            self?.syncFolder()
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.elapsed = self.player?.currentTime ?? 0
@@ -65,7 +93,7 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
             name: AVAudioSession.routeChangeNotification, object: nil)
     }
 
-    deinit { timer?.invalidate(); NotificationCenter.default.removeObserver(self) }
+    deinit { timer?.invalidate(); syncTimer?.invalidate(); NotificationCenter.default.removeObserver(self) }
 
     private func save() {
         do {
@@ -75,7 +103,7 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func importFiles(_ urls: [URL]) {
-        guard !importing else {
+        guard !importing && !syncing else {
             error = "A song is still being imported. Wait for it to finish, then share the next file."
             return
         }
@@ -134,6 +162,162 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 }
             }
         }
+    }
+
+    func linkSyncFolder(_ url: URL) {
+        guard !syncing && !importing else { return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            // Retain the source identity when reconnecting the same folder.
+            var id = UUID()
+            if let previous = linkedFolder {
+                var stale = false
+                if let oldURL = try? URL(resolvingBookmarkData: previous.bookmark,
+                    options: .withoutUI, relativeTo: nil, bookmarkDataIsStale: &stale),
+                   oldURL.standardizedFileURL == url.standardizedFileURL { id = previous.id }
+            }
+            let link = LinkedMusicFolder(id: id, name: url.lastPathComponent,
+                bookmark: try url.bookmarkData(options: .minimalBookmark,
+                    includingResourceValuesForKeys: nil, relativeTo: nil))
+            try JSONEncoder().encode(link).write(to: syncSettings, options: .atomic)
+            linkedFolder = link; syncFolderName = link.name; lastSync = nil
+            syncFolder()
+        } catch {
+            self.error = "This provider could not grant folder access: \(error.localizedDescription)"
+        }
+    }
+
+    func unlinkSyncFolder() {
+        guard !syncing else { return }
+        do {
+            if FileManager.default.fileExists(atPath: syncSettings.path) {
+                try FileManager.default.removeItem(at: syncSettings)
+            }
+            linkedFolder = nil; syncFolderName = nil; lastSync = nil
+            syncStatus = "Folder unlinked. Your downloaded songs are still in Library."
+            syncDetails = ""
+        } catch { self.error = "Could not unlink the folder: \(error.localizedDescription)" }
+    }
+
+    func syncFolder() {
+        guard let link = linkedFolder, !syncing, !importing else { return }
+        syncing = true; syncStatus = "Checking \(link.name)…"; syncDetails = ""
+        let destinationFolder = folder
+        let known = Set(songs.compactMap(\.folderSource))
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var imported: [Song] = []
+            var failures: [String] = []
+            var refreshedLink = link
+            var scanCompleted = false
+            do {
+                var stale = false
+                let root = try URL(resolvingBookmarkData: link.bookmark, options: .withoutUI,
+                    relativeTo: nil, bookmarkDataIsStale: &stale)
+                let scoped = root.startAccessingSecurityScopedResource()
+                defer { if scoped { root.stopAccessingSecurityScopedResource() } }
+                if stale {
+                    refreshedLink.bookmark = try root.bookmarkData(options: .minimalBookmark,
+                        includingResourceValuesForKeys: nil, relativeTo: nil)
+                }
+                // File providers must finish materializing data before it is copied.
+                let files = try Self.audioFiles(in: root)
+                for file in files {
+                    let url = file.url
+                    let source = link.id.uuidString + ":" + file.relative
+                    if known.contains(source) { continue }
+                    DispatchQueue.main.async { [weak self] in
+                        self?.syncStatus = "Downloading \(url.lastPathComponent)…"
+                    }
+                    let id = UUID()
+                    let name = id.uuidString + "." + url.pathExtension
+                    let destination = destinationFolder.appendingPathComponent(name)
+                    do {
+                        try Self.coordinatedCopy(from: url, to: destination)
+                        _ = try AVAudioPlayer(contentsOf: destination)
+                        let stem = url.deletingPathExtension().lastPathComponent
+                        let parts = stem.components(separatedBy: " - ")
+                        imported.append(Song(id: id, filename: name,
+                            title: parts.count > 1 ? parts.dropFirst().joined(separator: " - ") : stem,
+                            artist: parts.count > 1 ? parts[0] : "Local music", folderSource: source))
+                    } catch {
+                        try? FileManager.default.removeItem(at: destination)
+                        failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
+                    }
+                }
+                scanCompleted = true
+            } catch {
+                failures.append("Folder unavailable: \(error.localizedDescription). Check Files, your connection, or choose the folder again.")
+            }
+            let results = imported
+            let issues = failures
+            let renewed = refreshedLink
+            let completed = scanCompleted
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.songs.append(contentsOf: results)
+                if !results.isEmpty { self.save() }
+                if renewed.bookmark != link.bookmark {
+                    do {
+                        try JSONEncoder().encode(renewed).write(to: self.syncSettings, options: .atomic)
+                        self.linkedFolder = renewed
+                    } catch { self.error = "Folder access could not be saved. Choose it again next time." }
+                }
+                self.syncing = false
+                if completed && issues.isEmpty { self.lastSync = Date() }
+                self.syncStatus = issues.isEmpty
+                    ? (results.isEmpty ? "Up to date. No new songs." : "Added \(results.count) song(s). Ready in Library.")
+                    : "Added \(results.count) song(s). \(issues.count) item(s) need attention."
+                self.syncDetails = issues.prefix(8).joined(separator: "\n\n")
+            }
+        }
+    }
+
+    private static func audioFiles(in root: URL) throws -> [(url: URL, relative: String)] {
+        let coordinator = NSFileCoordinator()
+        var coordinationError: NSError?
+        var readError: Error?
+        var files: [(url: URL, relative: String)] = []
+        coordinator.coordinate(readingItemAt: root, options: [], error: &coordinationError) { directory in
+            do {
+                guard try directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+                    throw NSError(domain: "CadenceSync", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Choose a music folder, not a file."])
+                }
+                let extensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aif", "aiff", "caf", "flac", "mp4"]
+                guard let enumerator = FileManager.default.enumerator(at: directory,
+                    includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                    options: [.skipsHiddenFiles, .skipsPackageDescendants],
+                    errorHandler: { _, error in readError = error; return false }) else {
+                    throw NSError(domain: "CadenceSync", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "The provider could not list this folder."])
+                }
+                for case let url as URL in enumerator {
+                    let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                    if values.isSymbolicLink == true { enumerator.skipDescendants(); continue }
+                    if values.isRegularFile == true && extensions.contains(url.pathExtension.lowercased()) {
+                        let prefix = directory.standardizedFileURL.path + "/"
+                        guard url.standardizedFileURL.path.hasPrefix(prefix) else { continue }
+                        files.append((url, String(url.standardizedFileURL.path.dropFirst(prefix.count))))
+                    }
+                }
+            } catch { readError = error }
+        }
+        if let error = coordinationError { throw error }
+        if let error = readError { throw error }
+        return files.sorted { $0.relative < $1.relative }
+    }
+
+    private static func coordinatedCopy(from source: URL, to destination: URL) throws {
+        let coordinator = NSFileCoordinator()
+        var coordinationError: NSError?
+        var copyError: Error?
+        coordinator.coordinate(readingItemAt: source, options: [], error: &coordinationError) { readable in
+            do { try FileManager.default.copyItem(at: readable, to: destination) }
+            catch { copyError = error }
+        }
+        if let error = coordinationError { throw error }
+        if let error = copyError { throw error }
     }
 
     func play(_ song: Song, in list: [Song]? = nil) {
