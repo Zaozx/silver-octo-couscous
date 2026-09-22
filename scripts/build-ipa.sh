@@ -10,6 +10,8 @@ BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cadence-build.XXXXXX")"
 # This unique scratch directory was created above and never accepts user input.
 trap 'rm -rf "$BUILD_DIR"' EXIT
 mkdir -p "$ROOT/artifacts" "$BUILD_DIR/Payload"
+swiftc "$ROOT/Cadence/DriveModels.swift" "$ROOT/tests/main.swift" -o "$BUILD_DIR/drive-model-tests"
+"$BUILD_DIR/drive-model-tests"
 xcodebuild -project "$ROOT/Cadence.xcodeproj" -scheme Cadence \
   -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
   -derivedDataPath "$BUILD_DIR/DerivedData" \

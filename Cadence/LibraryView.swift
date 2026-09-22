@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 import MediaPlayer
 import AVKit
 import SafariServices
+import GoogleSignIn
 
 enum Theme {
     static let background = Color(red: 0.04, green: 0.06, blue: 0.05)
@@ -13,6 +14,7 @@ enum Theme {
 
 struct LibraryView: View {
     @EnvironmentObject private var music: MusicStore
+    @EnvironmentObject private var drive: GoogleDriveSync
     @Environment(\.scenePhase) private var scenePhase
     @State private var importPresented = false
     @State private var nowPresented = false
@@ -35,16 +37,24 @@ struct LibraryView: View {
                 PlaylistsView().safeAreaInset(edge: .bottom, spacing: 0) { miniPlayer }
             }.tabItem { Label("Playlists", systemImage: "music.note.list") }.tag(2)
             NavigationStack {
-                FolderSyncView().safeAreaInset(edge: .bottom, spacing: 0) { miniPlayer }
+                GoogleDriveSyncView().safeAreaInset(edge: .bottom, spacing: 0) { miniPlayer }
             }.tabItem { Label("Sync", systemImage: "arrow.triangle.2.circlepath") }.tag(4)
         }
-        .onAppear { music.syncFolder() }
+        .task {
+            await drive.restore()
+            drive.checkAutomatically(music: music)
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(60)) } catch { break }
+                drive.checkAutomatically(music: music)
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { music.syncFolder() }
+            if phase == .active { drive.checkAutomatically(music: music) }
         }
         .toolbarBackground(Theme.background, for: .tabBar)
         .toolbarBackground(.visible, for: .tabBar)
         .onOpenURL { url in
+            if GIDSignIn.sharedInstance.handle(url) { return }
             guard url.isFileURL else {
                 music.error = "Share an audio file from Files, not a website link."
                 return
@@ -159,7 +169,7 @@ struct CollectionView: View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("CADENCE").font(.caption.weight(.bold)).tracking(2).foregroundStyle(Theme.mint)
-                Text("Version 1.2.0").font(.caption).foregroundStyle(Theme.muted)
+                Text("Version 1.3.0").font(.caption).foregroundStyle(Theme.muted)
                 Text("Stay for\nthe music.").font(.system(.largeTitle, design: .rounded, weight: .bold))
                 if let first = music.songs.first {
                     Button { music.play(first, in: music.songs) } label: { Label("Press play", systemImage: "play.fill").font(.subheadline.bold()) }
@@ -339,94 +349,6 @@ struct AirPlayPicker: UIViewRepresentable {
 
 // Import a copy rather than opening a document-provider URL in place.
 // iOS completes the provider handoff before delivering the selected URLs.
-struct FolderSyncView: View {
-    @EnvironmentObject private var music: MusicStore
-    @State private var choosing = false
-    @State private var unlinking = false
-    private var busy: Bool { music.syncing || music.importing }
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                Image(systemName: "folder.badge.arrow.down")
-                    .font(.system(size: 40)).foregroundStyle(Theme.mint)
-                Text("Your folder. Your music.").font(.title2.bold())
-                Text("Link a folder in Files. Cadence downloads new songs into your library so you can listen offline.")
-                    .foregroundStyle(Theme.muted)
-                VStack(alignment: .leading, spacing: 14) {
-                    Label(music.syncFolderName ?? "No folder linked", systemImage: "folder.fill")
-                        .font(.headline)
-                    if music.syncing { ProgressView(music.syncStatus) }
-                    else { Text(music.syncStatus).font(.subheadline) }
-                    if let date = music.lastSync {
-                        Text("Last successful check: \(date.formatted(date: .abbreviated, time: .shortened))")
-                            .font(.caption).foregroundStyle(Theme.muted)
-                    }
-                    Button { choosing = true } label: {
-                        Label(music.syncFolderName == nil ? "Choose music folder" : "Change folder",
-                              systemImage: "folder.badge.plus")
-                            .frame(maxWidth: .infinity).padding(.vertical, 5)
-                    }.buttonStyle(.borderedProminent).foregroundStyle(Theme.background).disabled(busy)
-                    if music.syncFolderName != nil {
-                        Button { music.syncFolder() } label: {
-                            Label("Sync now", systemImage: "arrow.triangle.2.circlepath")
-                                .frame(maxWidth: .infinity)
-                        }.buttonStyle(.bordered).disabled(busy)
-                        Button("Unlink folder", role: .destructive) { unlinking = true }.disabled(busy)
-                    }
-                }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Theme.surface, in: RoundedRectangle(cornerRadius: 18))
-                if !music.syncDetails.isEmpty {
-                    Text(music.syncDetails).font(.footnote).foregroundStyle(.orange).textSelection(.enabled)
-                }
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Using Google Drive").font(.headline)
-                    Text("Sign into the Drive app, enable it in Files → Browse → … → Edit, then try choosing your music folder above.")
-                    Text("If Drive is greyed out or will not let you select a folder, its Files integration does not support this feature. Direct Google account sync is not configured in this build. You can use a selectable iCloud Drive folder, or import individual Drive files with + in Library.")
-                    Link("Open your Google Drive folder", destination: URL(string: "https://drive.google.com/drive/folders/1OLRkulk0ASY2j0S0Id9PL2VgeJMnsfPa")!)
-                }.font(.subheadline).foregroundStyle(Theme.muted)
-                Text("Checks when Cadence opens and every minute while it is in the foreground. Cloud downloads use data and phone storage. Upload songs through your cloud provider’s app; Cadence only imports new files. Likes and playlists stay on this device.")
-                    .font(.footnote).foregroundStyle(Theme.muted)
-            }.padding(24).frame(maxWidth: 600).frame(maxWidth: .infinity)
-        }.background(Theme.background).navigationTitle("Folder sync")
-            .sheet(isPresented: $choosing) {
-                MusicFolderPicker { url in
-                    choosing = false
-                    music.linkSyncFolder(url)
-                } onCancel: { choosing = false }
-            }
-            .confirmationDialog("Unlink this folder? Downloaded songs will stay in Cadence.",
-                isPresented: $unlinking, titleVisibility: .visible) {
-                Button("Unlink folder", role: .destructive) { music.unlinkSyncFolder() }
-                Button("Cancel", role: .cancel) {}
-            }
-    }
-}
-
-struct MusicFolderPicker: UIViewControllerRepresentable {
-    let onPick: (URL) -> Void
-    let onCancel: () -> Void
-    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel) }
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
-        picker.allowsMultipleSelection = false
-        picker.delegate = context.coordinator
-        return picker
-    }
-    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let onPick: (URL) -> Void
-        let onCancel: () -> Void
-        init(onPick: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
-            self.onPick = onPick; self.onCancel = onCancel
-        }
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            if let url = urls.first { onPick(url) } else { onCancel() }
-        }
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onCancel() }
-    }
-}
-
 struct AudioImportPicker: UIViewControllerRepresentable {
     let onPick: ([URL]) -> Void
     let onCancel: () -> Void

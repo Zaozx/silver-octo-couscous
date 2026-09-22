@@ -78,10 +78,8 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 syncStatus = "Ready to check for new songs."
             } catch { syncStatus = "Folder access could not be restored. Choose the folder again." }
         }
-        syncTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            guard UIApplication.shared.applicationState == .active else { return }
-            self?.syncFolder()
-        }
+        // Direct Google Drive sync now owns foreground scheduling. Legacy
+        // folder bookmarks stay saved but no longer start provider scans.
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.elapsed = self.player?.currentTime ?? 0
@@ -95,11 +93,56 @@ final class MusicStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     deinit { timer?.invalidate(); syncTimer?.invalidate(); NotificationCenter.default.removeObserver(self) }
 
-    private func save() {
+    @discardableResult private func save() -> Bool {
         do {
             let data = try JSONEncoder().encode(SavedLibrary(songs: songs, playlists: playlists))
             try data.write(to: database, options: .atomic)
-        } catch { self.error = "Your changes could not be saved: \(error.localizedDescription)" }
+            return true
+        } catch { self.error = "Your changes could not be saved: \(error.localizedDescription)"; return false }
+    }
+
+    @MainActor func beginDriveImport() -> Bool {
+        guard !importing && !syncing else { return false }
+        importing = true; importStatus = "Syncing Google Drive…"
+        return true
+    }
+
+    @MainActor func endDriveImport(added: Int) {
+        importing = false
+        importStatus = "Google Drive: added \(added) song(s)."
+    }
+
+    @MainActor func hasDriveFile(_ id: String) -> Bool {
+        songs.contains { $0.folderSource == "gdrive:" + id }
+    }
+
+    @MainActor func addDriveFile(_ local: URL, name: String, id: String) async throws {
+        let destinationFolder = folder
+        let song = try await Task.detached(priority: .utility) {
+            let songID = UUID()
+            let filename = songID.uuidString + "." + (name as NSString).pathExtension
+            let destination = destinationFolder.appendingPathComponent(filename)
+            do {
+                try FileManager.default.copyItem(at: local, to: destination)
+                _ = try AVAudioPlayer(contentsOf: destination)
+                let stem = (name as NSString).deletingPathExtension
+                let parts = stem.components(separatedBy: " - ")
+                return Song(id: songID, filename: filename,
+                    title: parts.count > 1 ? parts.dropFirst().joined(separator: " - ") : stem,
+                    artist: parts.count > 1 ? parts[0] : "Google Drive", folderSource: "gdrive:" + id)
+            } catch { try? FileManager.default.removeItem(at: destination); throw error }
+        }.value
+        do {
+            try Task.checkCancellation()
+            songs.append(song)
+            guard save() else {
+                songs.removeAll { $0.id == song.id }
+                throw DriveSyncError.message("The downloaded song could not be saved to your library. Check free storage and retry.")
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: folder.appendingPathComponent(song.filename))
+            throw error
+        }
     }
 
     func importFiles(_ urls: [URL]) {
